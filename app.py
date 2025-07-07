@@ -9,11 +9,22 @@ from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import InputRequired, Length, ValidationError
 from flask_bcrypt import Bcrypt, generate_password_hash, check_password_hash
 from flask_login import login_required
+from flask_cors import CORS
+from werkzeug.datastructures import MultiDict
+from flask import make_response
+
+
 
 app = Flask(__name__)
 
 load_dotenv()
 
+app.config.update(
+    SESSION_COOKIE_SAMESITE='None',
+    SESSION_COOKIE_SECURE=False  # WARNING: only for localhost development
+)
+
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://127.0.0.1:5173"}})
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 connection = pymongo.MongoClient(os.getenv('MONGO'))
 db = connection['BookReviewProject']
@@ -22,6 +33,7 @@ reading_plans_collection = db['reading_plans']
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+bcrypt = Bcrypt(app)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -64,25 +76,35 @@ class LoginForm(FlaskForm):
 #     print(books)
 #     return render_template('index.html', books = books)
 
-@app.route('/', methods=['GET', 'POST'])
-def home():
-    form = LoginForm()
-    if form.validate_on_submit():
-        user = db.User.find_one({'username': form.username.data})
+# @app.route('/', methods=['GET', 'POST'])
+# def home():
+#     form = LoginForm()
+#     if form.validate_on_submit():
+#         user = db.User.find_one({'username': form.username.data})
 
-        if user and Bcrypt().check_password_hash(user['password'], form.password.data):
-            login_user(User(user))
-            return redirect(url_for('index'))
-        else:
-            flash('Invalid username or password', 'danger')
+#         if user and Bcrypt().check_password_hash(user['password'], form.password.data):
+#             login_user(User(user))
+#             print(f"User {current_user.username} logged in")
+#             return redirect(url_for('index'))
+#         else:
+#             flash('Invalid username or password', 'danger')
 
-    return render_template('login.html', form=form)
+#     return render_template('login.html', form=form)
 
 @app.route('/index')
 @login_required
 def index():
     books = list(books_collection.find({'user_id': ObjectId(current_user.id)}))
-    return render_template('index.html', books=books)
+    print(books)
+    return jsonify({"books": [{
+        '_id': str(book['_id']),
+        'title': book['title'],
+        'author': book['author'],
+        'genre': book['genre'],
+        'year': book['year'],
+        'rating': book['rating'],
+        'review': book['review']
+    } for book in books]})
 
 @app.route('/add_book', methods=['GET', 'POST'])
 def add_book():
@@ -111,7 +133,7 @@ def add_book():
 
     return render_template('add_book.html')
 
-@app.route('/delete_book/<book_id>', methods=['POST'])
+@app.route('/delete_book/<book_id>', methods=['DELETE'])
 def delete_book(book_id):
     book = books_collection.find_one({'_id': ObjectId(book_id), 'user_id': ObjectId(current_user.id)})
     if not book:
@@ -259,11 +281,13 @@ def get_reading_plan(plan_id):
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    form = RegistrationForm()
-
-    if form.validate_on_submit():
+    data = request.get_json()
+    print(data)
+    form = RegistrationForm(formdata=MultiDict(data), meta={'csrf': False})
+    print(form.name.data, form.username.data, form.password.data)
+    if form.validate():
         form.validate_username(form.username)
-        hashed_password = Bcrypt().generate_password_hash(form.password.data)
+        hashed_password = bcrypt.generate_password_hash(form.password.data)
 
         user = {
             'name': form.name.data,
@@ -272,26 +296,30 @@ def register():
         }
 
         db.User.insert_one(user)
-        return redirect(url_for('home'))
-    return render_template('registration.html', form=form)
-
+        return jsonify({'message': 'Registration successful'}), 201
+    else:
+        errors = form.errors
+        return jsonify({'errors': errors}), 400
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    form = LoginForm()
+    data = request.get_json()
+    form = LoginForm(formdata=MultiDict(data), meta={'csrf': False})
 
-    if form.validate_on_submit():
+    if form.validate():
         user = db.User.find_one({
             'username': form.username.data
         })
         
-        if user and Bcrypt().check_password_hash(user['password'], form.password.data):
+        if user and bcrypt.check_password_hash(user['password'], form.password.data):
             login_user(User(user))
-            return redirect(url_for('index'))
+            print(f"{current_user.is_authenticated} auth")
+            return jsonify({'message': 'Login successful'}), 200
         else:
-            flash('Invalid username or password', 'danger')
-
-    return render_template('login.html', form=form)
+            return jsonify({'error': 'Invalid username or password'}), 401
+    else:
+        errors = form.errors
+        return jsonify({'errors': errors}), 400
 
 @app.route('/logout')
 @login_required
@@ -324,6 +352,21 @@ def search_books():
         'review': book['review']
     } for book in books])
 
+@login_manager.unauthorized_handler
+def unauthorized():
+    response = jsonify({'error': 'Unauthorized'})
+    response.status_code = 401
+    response.headers.add("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+    response.headers.add("Access-Control-Allow-Credentials", "true")
+    return response
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = 'http://127.0.0.1:5173'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+    return response
 
 if __name__ == '__main__':
     app.run()
